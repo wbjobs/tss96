@@ -32,6 +32,7 @@
       <button class="tab active" data-tab="history">History</button>
       <button class="tab" data-tab="devices">Devices</button>
       <button class="tab" data-tab="tags">Tags</button>
+      <button class="tab" data-tab="conversions">Conversions</button>
     </nav>
 
     <div class="search-bar">
@@ -63,6 +64,13 @@
         </div>
         <div id="tags-list" class="tags-list"></div>
       </section>
+
+      <section id="tab-conversions" class="tab-panel">
+        <div class="tag-input-row">
+          <button class="btn btn-primary" id="btn-new-conversion-rule">＋ New Conversion Rule</button>
+        </div>
+        <div id="conversion-rules-list"></div>
+      </section>
     </main>
 
     <div id="clip-detail-modal" class="modal" style="display:none;">
@@ -74,6 +82,7 @@
         <div class="modal-body" id="clip-detail-body"></div>
         <div class="modal-footer">
           <button class="btn btn-primary" id="btn-copy-clip">Copy to Clipboard</button>
+          <button class="btn btn-secondary" id="btn-copy-converted">Paste with Conversion</button>
           <button class="btn btn-secondary" id="btn-push-clip">Push to Device</button>
           <button class="btn btn-danger" id="btn-delete-clip">Delete</button>
         </div>
@@ -117,6 +126,92 @@
           </div>
           <button class="btn btn-primary" id="btn-save-settings">Save & Reconnect</button>
         </div>
+      </div>
+    </div>
+
+    <div id="conversion-rule-modal" class="modal" style="display:none;">
+      <div class="modal-content" style="max-width:560px;">
+        <div class="modal-header">
+          <h3 id="conversion-rule-title">New Conversion Rule</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>Name</label>
+            <input type="text" id="cr-name" placeholder="e.g. Strip Line Numbers" />
+          </div>
+          <div class="form-group">
+            <label>Description</label>
+            <input type="text" id="cr-description" placeholder="Short description" />
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+            <div class="form-group">
+              <label>Source Type</label>
+              <select id="cr-source-type">
+                <option value="text">Text</option>
+                <option value="image">Image</option>
+                <option value="file">File</option>
+                <option value="any">Any</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label>Target Type</label>
+              <select id="cr-target-type">
+                <option value="text">Text</option>
+                <option value="image">Image</option>
+                <option value="file">File</option>
+              </select>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Transform</label>
+            <select id="cr-transform">
+              <option value="regex_replace">Regex Replace</option>
+              <option value="image_to_base64">Image → Base64 Data URL</option>
+              <option value="file_to_base64">File → Base64</option>
+              <option value="url_decode">URL Decode</option>
+            </select>
+          </div>
+          <div id="cr-regex-fields">
+            <div class="form-group">
+              <label>Regex Pattern (with 'gm' flags)</label>
+              <input type="text" id="cr-pattern" placeholder="e.g. ^\s*\d+\s*[|\.]?\s*" />
+            </div>
+            <div class="form-group">
+              <label>Replacement</label>
+              <input type="text" id="cr-replacement" placeholder="e.g. (leave empty to delete match)" />
+            </div>
+            <div class="form-group">
+              <label>Test with sample text</label>
+              <textarea id="cr-test-text" rows="4" placeholder="Paste sample text here to test..." style="width:100%;background:var(--bg-tertiary);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:8px;font-size:12px;"></textarea>
+              <div id="cr-test-result" style="margin-top:6px;font-size:12px;color:var(--text-muted);white-space:pre-wrap;word-break:break-all;"></div>
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Priority (lower = earlier)</label>
+            <input type="number" id="cr-priority" value="100" min="1" max="9999" />
+          </div>
+          <div class="form-group">
+            <label style="display:flex;align-items:center;gap:6px;">
+              <input type="checkbox" id="cr-enabled" checked />
+              Enabled
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary modal-close">Cancel</button>
+          <button class="btn btn-primary" id="btn-save-conversion-rule">Save Rule</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="conversion-pick-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Paste with Conversion</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="conversion-pick-body"></div>
       </div>
     </div>
 

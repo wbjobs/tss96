@@ -9,6 +9,8 @@ const uploads = new Map();
 const pendingConflicts = [];
 let currentConflict = null;
 let selectedConflictClipId = null;
+let conversionRules = [];
+let editingRuleId = null;
 
 async function init() {
   currentDevice = await api.getDeviceInfo();
@@ -24,12 +26,14 @@ async function init() {
   setupRealtime();
   setupUploadsPanel();
   setupConflictUI();
+  setupConversionUI();
 
   await loadClips();
   await loadDevices();
   await loadTags();
   await loadPendingConflicts();
   await refreshUploadQueue();
+  await loadConversionRules();
 }
 
 function setupUploadsPanel() {
@@ -233,6 +237,7 @@ function setupTabs() {
 
       if (tab.dataset.tab === "devices") loadDevices();
       if (tab.dataset.tab === "tags") loadTags();
+      if (tab.dataset.tab === "conversions") loadConversionRules();
     });
   });
 }
@@ -267,6 +272,11 @@ function setupModals() {
     await api.copyToClipboard(selectedClip);
     showNotification("Copied to clipboard!");
     document.getElementById("clip-detail-modal").style.display = "none";
+  });
+
+  document.getElementById("btn-copy-converted").addEventListener("click", async () => {
+    if (!selectedClip) return;
+    await openConversionPicker(selectedClip);
   });
 
   document.getElementById("btn-push-clip").addEventListener("click", async () => {
@@ -678,6 +688,267 @@ function showNotification(msg) {
   el.textContent = msg;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 3000);
+}
+
+async function loadConversionRules() {
+  try {
+    conversionRules = await api.apiRequest("GET", "/api/conversion-rules");
+    renderConversionRules();
+  } catch {}
+}
+
+function renderConversionRules() {
+  const list = document.getElementById("conversion-rules-list");
+  if (!conversionRules.length) {
+    list.innerHTML = '<div class="empty-state"><p>No conversion rules yet.</p></div>';
+    return;
+  }
+
+  const srcMap = { text: "Text", image: "Image", file: "File", any: "Any" };
+  const tgtMap = { text: "Text", image: "Image", file: "File" };
+  const transformMap = {
+    regex_replace: "Regex Replace", image_to_base64: "Image→Base64", file_to_base64: "File→Base64", url_decode: "URL Decode"
+  };
+
+  list.innerHTML = conversionRules
+    .map((r) => {
+      const enabledLabel = r.enabled ? "Enabled" : "Disabled";
+      const enabledColor = r.enabled ? "var(--success)" : "var(--text-muted)";
+      const actions = r.builtin
+        ? `<button class="btn btn-sm btn-secondary btn-toggle-rule" data-rule-id="${r.id}">${r.enabled ? "Disable" : "Enable"}</button>`
+        : `<button class="btn btn-sm btn-secondary btn-edit-rule" data-rule-id="${r.id}">Edit</button>
+           <button class="btn btn-sm btn-secondary btn-toggle-rule" data-rule-id="${r.id}">${r.enabled ? "Disable" : "Enable"}</button>
+           <button class="btn btn-sm btn-danger btn-delete-rule" data-rule-id="${r.id}">Delete</button>`;
+      return `<div class="conversion-rule-card" data-rule-id="${r.id}">
+        <div class="cr-header">
+          <span class="cr-name">${escapeHtml(r.name)}</span>
+          ${r.builtin ? '<span class="builtin-badge">Built-in</span>' : ""}
+          <span class="cr-type-badge">${srcMap[r.source_type]} → ${tgtMap[r.target_type]}</span>
+          <span style="font-size:11px;color:${enabledColor};font-weight:600;">${enabledLabel}</span>
+        </div>
+        <div class="cr-description">${escapeHtml(r.description || "")}</div>
+        <div class="cr-meta">
+          <span><strong>Transform:</strong> ${transformMap[r.transform] || r.transform}</span>
+          <span><strong>Priority:</strong> ${r.priority}</span>
+          ${r.pattern ? `<span><strong>Pattern:</strong> <code style="background:var(--bg);padding:1px 4px;border-radius:3px;">${escapeHtml(r.pattern)}</code></span>` : ""}
+        </div>
+        <div class="cr-actions">${actions}</div>
+      </div>`;
+    })
+    .join("");
+
+  list.querySelectorAll(".btn-edit-rule").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openRuleEditor(btn.dataset.ruleId);
+    });
+  });
+
+  list.querySelectorAll(".btn-delete-rule").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      if (!confirm("Delete this conversion rule?")) return;
+      await api.apiRequest("DELETE", `/api/conversion-rules/${btn.dataset.ruleId}`);
+      showNotification("Rule deleted");
+      await loadConversionRules();
+    });
+  });
+
+  list.querySelectorAll(".btn-toggle-rule").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const rule = conversionRules.find((r) => r.id === btn.dataset.ruleId);
+      if (!rule) return;
+      await api.apiRequest("PUT", `/api/conversion-rules/${rule.id}`, { enabled: !rule.enabled });
+      await loadConversionRules();
+    });
+  });
+}
+
+function setupConversionUI() {
+  document.getElementById("btn-new-conversion-rule").addEventListener("click", () => {
+    openRuleEditor(null);
+  });
+
+  const transformSel = document.getElementById("cr-transform");
+  if (transformSel) {
+    transformSel.addEventListener("change", toggleRegexFields);
+  }
+
+  const testText = document.getElementById("cr-test-text");
+  if (testText) {
+    let testTimer;
+    testText.addEventListener("input", () => {
+      clearTimeout(testTimer);
+      testTimer = setTimeout(runRegexTest, 300);
+    });
+  }
+
+  const patternInput = document.getElementById("cr-pattern");
+  if (patternInput) {
+    let pTimer;
+    patternInput.addEventListener("input", () => {
+      clearTimeout(pTimer);
+      pTimer = setTimeout(runRegexTest, 300);
+    });
+  }
+
+  const replacementInput = document.getElementById("cr-replacement");
+  if (replacementInput) {
+    let rTimer;
+    replacementInput.addEventListener("input", () => {
+      clearTimeout(rTimer);
+      rTimer = setTimeout(runRegexTest, 300);
+    });
+  }
+
+  document.getElementById("btn-save-conversion-rule").addEventListener("click", async () => {
+    await saveRuleEditor();
+  });
+}
+
+async function runRegexTest() {
+  const pattern = document.getElementById("cr-pattern").value;
+  const sample = document.getElementById("cr-test-text").value;
+  const replacement = document.getElementById("cr-replacement").value;
+  const resultDiv = document.getElementById("cr-test-result");
+  if (!pattern || !sample) {
+    resultDiv.textContent = "";
+    return;
+  }
+  const test = await api.testRegex(pattern, sample);
+  if (!test.ok) {
+    resultDiv.style.color = "var(--danger)";
+    resultDiv.textContent = `Regex error: ${test.error}`;
+    return;
+  }
+  try {
+    const regex = new RegExp(pattern, "gm");
+    const replaced = sample.replace(regex, replacement);
+    resultDiv.style.color = "var(--text-secondary)";
+    resultDiv.textContent = `Match count: ${test.matches.length}\n\nResult:\n${replaced}`;
+  } catch (e) {
+    resultDiv.style.color = "var(--danger)";
+    resultDiv.textContent = e.message;
+  }
+}
+
+function toggleRegexFields() {
+  const transform = document.getElementById("cr-transform").value;
+  const fields = document.getElementById("cr-regex-fields");
+  if (transform === "regex_replace") {
+    fields.style.display = "block";
+  } else {
+    fields.style.display = "none";
+  }
+}
+
+function openRuleEditor(ruleId) {
+  editingRuleId = ruleId;
+  const rule = ruleId ? conversionRules.find((r) => r.id === ruleId) : null;
+  document.getElementById("conversion-rule-title").textContent = rule ? "Edit Conversion Rule" : "New Conversion Rule";
+  document.getElementById("cr-name").value = rule ? rule.name : "";
+  document.getElementById("cr-description").value = rule ? rule.description || "" : "";
+  document.getElementById("cr-source-type").value = rule ? rule.source_type : "text";
+  document.getElementById("cr-target-type").value = rule ? rule.target_type : "text";
+  document.getElementById("cr-transform").value = rule ? rule.transform : "regex_replace";
+  document.getElementById("cr-pattern").value = rule ? rule.pattern || "" : "";
+  document.getElementById("cr-replacement").value = rule ? rule.replacement || "" : "";
+  document.getElementById("cr-priority").value = rule ? rule.priority : 100;
+  document.getElementById("cr-enabled").checked = rule ? rule.enabled : true;
+  document.getElementById("cr-test-text").value = "";
+  document.getElementById("cr-test-result").textContent = "";
+  toggleRegexFields();
+  document.getElementById("conversion-rule-modal").style.display = "flex";
+}
+
+async function saveRuleEditor() {
+  const name = document.getElementById("cr-name").value.trim();
+  if (!name) {
+    showNotification("Name is required");
+    return;
+  }
+
+  const payload = {
+    name,
+    description: document.getElementById("cr-description").value.trim(),
+    source_type: document.getElementById("cr-source-type").value,
+    target_type: document.getElementById("cr-target-type").value,
+    transform: document.getElementById("cr-transform").value,
+    pattern: document.getElementById("cr-pattern").value || null,
+    replacement: document.getElementById("cr-replacement").value || null,
+    priority: parseInt(document.getElementById("cr-priority").value) || 100,
+    enabled: document.getElementById("cr-enabled").checked,
+  };
+
+  if (editingRuleId) {
+    await api.apiRequest("PUT", `/api/conversion-rules/${editingRuleId}`, payload);
+    showNotification("Rule updated");
+  } else {
+    await api.apiRequest("POST", "/api/conversion-rules", payload);
+    showNotification("Rule created");
+  }
+
+  editingRuleId = null;
+  document.getElementById("conversion-rule-modal").style.display = "none";
+  await loadConversionRules();
+}
+
+async function openConversionPicker(clip) {
+  if (!conversionRules.length) await loadConversionRules();
+  const enabledRules = conversionRules.filter(
+    (r) => r.enabled && (r.source_type === clip.type || r.source_type === "any")
+  );
+
+  const body = document.getElementById("conversion-pick-body");
+  if (!enabledRules.length) {
+    body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;">No matching conversion rules for this clip type.<br>Configure them in the <strong>Conversions</strong> tab.</p>';
+    document.getElementById("conversion-pick-modal").style.display = "flex";
+    return;
+  }
+
+  const html = [];
+  for (const rule of enabledRules) {
+    const converted = await api.convertClipLocal(clip, rule);
+    if (!converted) continue;
+    let preview = "";
+    if (converted.type === "text") {
+      const content = converted.content || "";
+      preview = content.length > 800 ? content.slice(0, 800) + "\n... (truncated)" : content;
+    } else {
+      preview = "[" + converted.type.toUpperCase() + " content]";
+    }
+    html.push(`
+      <div class="conversion-option-card" data-rule-id="${rule.id}">
+        <div class="conversion-option-header">
+          <span class="conversion-option-name">${escapeHtml(rule.name)}</span>
+          <span class="cr-type-badge">${clip.type} → ${converted.type}</span>
+        </div>
+        <div class="conversion-option-preview">${escapeHtml(preview)}</div>
+      </div>
+    `);
+  }
+
+  if (!html.length) {
+    body.innerHTML = '<p style="color:var(--text-muted);text-align:center;padding:20px;">No conversion available for this clip.</p>';
+  } else {
+    body.innerHTML = html.join("");
+    body.querySelectorAll(".conversion-option-card").forEach((card) => {
+      card.addEventListener("click", async () => {
+        const rule = conversionRules.find((r) => r.id === card.dataset.ruleId);
+        const result = await api.copyToClipboardWithConversion(clip, rule);
+        if (result.ok) {
+          showNotification(`Pasted as: ${rule.name}`);
+        } else {
+          showNotification("Conversion failed: " + (result.error || "unknown"));
+        }
+        document.getElementById("conversion-pick-modal").style.display = "none";
+        document.getElementById("clip-detail-modal").style.display = "none";
+      });
+    });
+  }
+
+  document.getElementById("conversion-pick-modal").style.display = "flex";
 }
 
 init();

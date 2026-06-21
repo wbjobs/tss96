@@ -6,9 +6,13 @@ contextBridge.exposeInMainWorld("clipSync", {
   saveConfig: (config) => ipcRenderer.invoke("save-config", config),
   pushToDevice: (targetDeviceId, clip) => ipcRenderer.invoke("push-to-device", targetDeviceId, clip),
   copyToClipboard: (clip) => ipcRenderer.invoke("copy-to-clipboard", clip),
+  copyToClipboardWithConversion: (clip, rule) => ipcRenderer.invoke("copy-to-clipboard-with-conversion", clip, rule),
   apiRequest: (method, path, body, isFormData) => ipcRenderer.invoke("api-request", method, path, body, isFormData),
   getUploadQueue: () => ipcRenderer.invoke("get-upload-queue"),
   abortUpload: (taskId) => ipcRenderer.invoke("abort-upload", taskId),
+  convertClipLocal: (clip, rule) => ipcRenderer.invoke("convert-clip-local", clip, rule),
+  convertClipAllLocal: (clip, rules) => ipcRenderer.invoke("convert-clip-all-local", clip, rules),
+  testRegex: (pattern, text) => ipcRenderer.invoke("test-regex", pattern, text),
 
   onClipboardChanged: (cb) => {
     ipcRenderer.on("clipboard-changed", (_e, clip) => cb(clip));

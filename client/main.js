@@ -13,6 +13,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
 const WebSocket = require("ws");
+const { applyRuleLocal, applyAllMatchingRulesLocal } = require("./converter");
 
 const DEVICE_ID_FILE = path.join(app.getPath("userData"), "device.json");
 const CONFIG_FILE = path.join(app.getPath("userData"), "config.json");
@@ -559,6 +560,37 @@ app.whenReady().then(() => {
         .catch(() => {});
     }
     return true;
+  });
+
+  ipcMain.handle("convert-clip-local", async (_e, clip, rule) => {
+    const converted = applyRuleLocal(rule, clip);
+    return converted;
+  });
+
+  ipcMain.handle("convert-clip-all-local", async (_e, clip, rules) => {
+    return applyAllMatchingRulesLocal(rules, clip);
+  });
+
+  ipcMain.handle("copy-to-clipboard-with-conversion", async (_e, clip, rule) => {
+    const converted = applyRuleLocal(rule, clip);
+    if (!converted) return { ok: false, error: "Conversion failed" };
+    if (converted.type === "text" && converted.content) {
+      clipboard.writeText(converted.content);
+      lastClipboardText = converted.content;
+    } else if (converted.type === "image" && converted.localPath && fs.existsSync(converted.localPath)) {
+      const img = nativeImage.createFromBuffer(fs.readFileSync(converted.localPath));
+      clipboard.writeImage(img);
+    }
+    return { ok: true, converted };
+  });
+
+  ipcMain.handle("test-regex", (_e, pattern, text) => {
+    try {
+      const regex = new RegExp(pattern, "gm");
+      return { ok: true, matches: text.match(regex) || [] };
+    } catch (e) {
+      return { ok: false, error: e.message };
+    }
   });
 
   ipcMain.on("ws-status", (e) => e);

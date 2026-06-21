@@ -1,6 +1,7 @@
 const Database = require("better-sqlite3");
 const path = require("path");
 const fs = require("fs");
+const { v4: uuidv4 } = require("uuid");
 
 const DATA_DIR = path.join(__dirname, "..", "data");
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -63,6 +64,21 @@ db.exec(`
     FOREIGN KEY (clip_id_b) REFERENCES clips(id) ON DELETE CASCADE
   );
 
+  CREATE TABLE IF NOT EXISTS conversion_rules (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    source_type TEXT NOT NULL CHECK(source_type IN ('text','image','file','any')),
+    target_type TEXT NOT NULL CHECK(target_type IN ('text','image','file')),
+    transform TEXT NOT NULL,
+    pattern TEXT,
+    replacement TEXT,
+    enabled INTEGER DEFAULT 1,
+    builtin INTEGER DEFAULT 0,
+    priority INTEGER DEFAULT 100,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
   CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL UNIQUE
@@ -83,6 +99,104 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_clips_file_hash ON clips(file_hash);
   CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
   CREATE INDEX IF NOT EXISTS idx_conflicts_resolved ON conflicts(resolved);
+  CREATE INDEX IF NOT EXISTS idx_conv_source_type ON conversion_rules(source_type);
+  CREATE INDEX IF NOT EXISTS idx_conv_enabled ON conversion_rules(enabled);
 `);
+
+function seedBuiltinRules() {
+  const count = db.prepare("SELECT COUNT(*) as c FROM conversion_rules WHERE builtin = 1").get().c;
+  if (count > 0) return;
+
+  const builtins = [
+    {
+      id: uuidv4(),
+      name: "Image → Base64 Data URL",
+      description: "Convert clipboard image to base64-encoded data URI (e.g. data:image/png;base64,...)",
+      source_type: "image",
+      target_type: "text",
+      transform: "image_to_base64",
+      pattern: null,
+      replacement: null,
+      priority: 10,
+    },
+    {
+      id: uuidv4(),
+      name: "Strip Line Numbers",
+      description: "Remove leading line numbers from copied code (e.g. '  42 | function()' → 'function()')",
+      source_type: "text",
+      target_type: "text",
+      transform: "regex_replace",
+      pattern: "^\\s*\\d+\\s*[|\\.\\:]?\\s*",
+      replacement: "",
+      priority: 20,
+    },
+    {
+      id: uuidv4(),
+      name: "Strip IDE Diff Markers",
+      description: "Remove leading +/-/@@ markers from git diff output",
+      source_type: "text",
+      target_type: "text",
+      transform: "regex_replace",
+      pattern: "^(\\+{1,2}|-{1,2}|@@.*@@)\\s*",
+      replacement: "",
+      priority: 25,
+    },
+    {
+      id: uuidv4(),
+      name: "URL Decode",
+      description: "Decode percent-encoded URLs and query strings",
+      source_type: "text",
+      target_type: "text",
+      transform: "url_decode",
+      pattern: null,
+      replacement: null,
+      priority: 30,
+    },
+    {
+      id: uuidv4(),
+      name: "HTML Strip Tags",
+      description: "Remove all HTML tags, keep plain text",
+      source_type: "text",
+      target_type: "text",
+      transform: "regex_replace",
+      pattern: "<[^>]*>",
+      replacement: "",
+      priority: 40,
+    },
+    {
+      id: uuidv4(),
+      name: "Trim Whitespace",
+      description: "Trim leading/trailing whitespace from each line",
+      source_type: "text",
+      target_type: "text",
+      transform: "regex_replace",
+      pattern: "^\\s+|\\s+$",
+      replacement: "",
+      priority: 50,
+    },
+    {
+      id: uuidv4(),
+      name: "File → Base64",
+      description: "Encode a binary file as base64 text",
+      source_type: "file",
+      target_type: "text",
+      transform: "file_to_base64",
+      pattern: null,
+      replacement: null,
+      priority: 60,
+    },
+  ];
+
+  const insert = db.prepare(
+    `INSERT INTO conversion_rules (id, name, description, source_type, target_type, transform, pattern, replacement, builtin, priority)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`
+  );
+
+  for (const r of builtins) {
+    insert.run(r.id, r.name, r.description, r.source_type, r.target_type, r.transform, r.pattern, r.replacement, r.priority);
+  }
+}
+
+seedBuiltinRules();
 
 module.exports = db;

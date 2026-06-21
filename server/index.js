@@ -9,6 +9,7 @@ const http = require("http");
 
 const db = require("./db");
 const { setupWebSocket, clients } = require("./ws");
+const { applyRule, applyAllMatchingRules } = require("./converter");
 
 const app = express();
 const server = http.createServer(app);
@@ -590,16 +591,153 @@ app.get("/api/tags/:tagName/clips", (req, res) => {
   res.json(clips);
 });
 
+app.get("/api/conversion-rules", (_req, res) => {
+  const rules = db
+    .prepare("SELECT * FROM conversion_rules ORDER BY priority ASC, created_at ASC")
+    .all();
+  res.json(rules);
+});
+
+app.post("/api/conversion-rules", (req, res) => {
+  const { name, description, source_type, target_type, transform, pattern, replacement, priority } = req.body;
+  if (!name || !source_type || !target_type || !transform) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!["text", "image", "file", "any"].includes(source_type)) {
+    return res.status(400).json({ error: "Invalid source_type" });
+  }
+  if (!["text", "image", "file"].includes(target_type)) {
+    return res.status(400).json({ error: "Invalid target_type" });
+  }
+
+  const id = uuidv4();
+  const p = priority || 100;
+  db.prepare(
+    `INSERT INTO conversion_rules (id, name, description, source_type, target_type, transform, pattern, replacement, builtin, priority)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)`
+  ).run(id, name, description || null, source_type, target_type, transform, pattern || null, replacement || null, p);
+
+  const rule = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(id);
+  res.json(rule);
+});
+
+app.put("/api/conversion-rules/:id", (req, res) => {
+  const rule = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(req.params.id);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+
+  const { name, description, source_type, target_type, transform, pattern, replacement, enabled, priority } = req.body;
+
+  if (source_type && !["text", "image", "file", "any"].includes(source_type)) {
+    return res.status(400).json({ error: "Invalid source_type" });
+  }
+  if (target_type && !["text", "image", "file"].includes(target_type)) {
+    return res.status(400).json({ error: "Invalid target_type" });
+  }
+
+  db.prepare(
+    `UPDATE conversion_rules SET
+       name = COALESCE(?, name),
+       description = COALESCE(?, description),
+       source_type = COALESCE(?, source_type),
+       target_type = COALESCE(?, target_type),
+       transform = COALESCE(?, transform),
+       pattern = ?,
+       replacement = ?,
+       enabled = COALESCE(?, enabled),
+       priority = COALESCE(?, priority)
+     WHERE id = ?`
+  ).run(
+    name || null,
+    description !== undefined ? description : null,
+    source_type || null,
+    target_type || null,
+    transform || null,
+    pattern !== undefined ? pattern : null,
+    replacement !== undefined ? replacement : null,
+    enabled !== undefined ? (enabled ? 1 : 0) : null,
+    priority !== undefined ? priority : null,
+    req.params.id
+  );
+
+  const updated = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(req.params.id);
+  res.json(updated);
+});
+
+app.delete("/api/conversion-rules/:id", (req, res) => {
+  const rule = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(req.params.id);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+  if (rule.builtin) return res.status(403).json({ error: "Cannot delete builtin rule" });
+
+  db.prepare("DELETE FROM conversion_rules WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+app.post("/api/conversion-rules/:id/apply", async (req, res) => {
+  const rule = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(req.params.id);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+
+  const clip = req.body.clip;
+  if (!clip) return res.status(400).json({ error: "Missing clip" });
+
+  if (rule.source_type !== "any" && clip.type !== rule.source_type) {
+    return res.json({ converted: null, skipped: true, reason: "type_mismatch" });
+  }
+
+  try {
+    const converted = await applyRule(rule, clip, DATA_DIR, "");
+    res.json({ converted, rule });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post("/api/clips/:id/convert-all", async (req, res) => {
+  const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(req.params.id);
+  if (!clip) return res.status(404).json({ error: "Clip not found" });
+
+  try {
+    const rules = db.prepare("SELECT * FROM conversion_rules WHERE enabled = 1").all();
+    const results = await applyAllMatchingRules(rules, clip, DATA_DIR, "");
+    res.json({ conversions: results, clip });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.post("/api/clips/:id/convert/:ruleId", async (req, res) => {
+  const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(req.params.id);
+  if (!clip) return res.status(404).json({ error: "Clip not found" });
+  const rule = db.prepare("SELECT * FROM conversion_rules WHERE id = ?").get(req.params.ruleId);
+  if (!rule) return res.status(404).json({ error: "Rule not found" });
+
+  try {
+    const converted = await applyRule(rule, clip, DATA_DIR, "");
+    res.json({ converted, rule });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+app.get("/api/conversion-transforms", (_req, res) => {
+  res.json([
+    { id: "regex_replace", name: "Regex Replace", description: "Match a regex pattern and replace with a string (supports $1, $2 capture groups). Uses 'gm' flags.", fields: ["pattern", "replacement"] },
+    { id: "image_to_base64", name: "Image → Base64 Data URL", description: "Convert an image clip into a base64-encoded data URI.", fields: [] },
+    { id: "file_to_base64", name: "File → Base64", description: "Encode a binary file as base64 text.", fields: [] },
+    { id: "url_decode", name: "URL Decode", description: "Decode percent-encoded URL strings.", fields: [] },
+  ]);
+});
+
 app.get("/api/stats", (_req, res) => {
   const totalClips = db.prepare("SELECT COUNT(*) as count FROM clips").get().count;
   const totalDevices = db.prepare("SELECT COUNT(*) as count FROM devices").get().count;
   const totalTags = db.prepare("SELECT COUNT(*) as count FROM tags").get().count;
   const totalConflicts = db.prepare("SELECT COUNT(*) as count FROM conflicts").get().count;
+  const totalConversionRules = db.prepare("SELECT COUNT(*) as count FROM conversion_rules").get().count;
   const pendingConflicts = db
     .prepare("SELECT COUNT(*) as count FROM conflicts WHERE resolved = 0")
     .get().count;
   const byType = db.prepare("SELECT type, COUNT(*) as count FROM clips GROUP BY type").all();
-  res.json({ totalClips, totalDevices, totalTags, totalConflicts, pendingConflicts, byType });
+  res.json({ totalClips, totalDevices, totalTags, totalConflicts, totalConversionRules, pendingConflicts, byType });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
