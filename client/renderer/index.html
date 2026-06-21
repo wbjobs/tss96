@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClipSync</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="app-header">
+      <div class="header-left">
+        <h1 class="logo">⌨ ClipSync</h1>
+        <span id="ws-indicator" class="status-dot disconnected" title="Disconnected"></span>
+      </div>
+      <div class="header-right">
+        <button class="btn btn-icon" id="btn-settings" title="Settings">⚙</button>
+      </div>
+    </header>
+
+    <nav class="tabs">
+      <button class="tab active" data-tab="history">History</button>
+      <button class="tab" data-tab="devices">Devices</button>
+      <button class="tab" data-tab="tags">Tags</button>
+    </nav>
+
+    <div class="search-bar">
+      <input type="text" id="search-input" placeholder="Search clips..." />
+      <select id="filter-type">
+        <option value="">All Types</option>
+        <option value="text">Text</option>
+        <option value="image">Image</option>
+        <option value="file">File</option>
+      </select>
+    </div>
+
+    <main class="content">
+      <section id="tab-history" class="tab-panel active">
+        <div id="clips-list" class="clips-list"></div>
+        <div id="clips-empty" class="empty-state" style="display:none;">
+          <p>No clips yet. Copy something to get started!</p>
+        </div>
+      </section>
+
+      <section id="tab-devices" class="tab-panel">
+        <div id="devices-list" class="devices-list"></div>
+      </section>
+
+      <section id="tab-tags" class="tab-panel">
+        <div class="tag-input-row">
+          <input type="text" id="new-tag-input" placeholder="New tag name..." />
+          <button class="btn btn-primary" id="btn-create-tag">Create</button>
+        </div>
+        <div id="tags-list" class="tags-list"></div>
+      </section>
+    </main>
+
+    <div id="clip-detail-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Clip Detail</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="clip-detail-body"></div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" id="btn-copy-clip">Copy to Clipboard</button>
+          <button class="btn btn-secondary" id="btn-push-clip">Push to Device</button>
+          <button class="btn btn-danger" id="btn-delete-clip">Delete</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="push-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Push to Device</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="push-device-list"></div>
+      </div>
+    </div>
+
+    <div id="tag-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Manage Tags</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body" id="tag-modal-body"></div>
+      </div>
+    </div>
+
+    <div id="settings-modal" class="modal" style="display:none;">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Settings</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label>Server HTTP URL</label>
+            <input type="text" id="setting-http-url" />
+          </div>
+          <div class="form-group">
+            <label>Server WebSocket URL</label>
+            <input type="text" id="setting-ws-url" />
+          </div>
+          <button class="btn btn-primary" id="btn-save-settings">Save & Reconnect</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
