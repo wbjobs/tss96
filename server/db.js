@@ -25,9 +25,42 @@ db.exec(`
     type TEXT NOT NULL CHECK(type IN ('text','image','file')),
     content TEXT,
     file_path TEXT,
+    file_size INTEGER,
+    file_hash TEXT,
     thumbnail TEXT,
     created_at TEXT DEFAULT (datetime('now')),
+    resolved INTEGER DEFAULT 0,
+    conflict_of TEXT,
     FOREIGN KEY (device_id) REFERENCES devices(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    clip_type TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    total_size INTEGER NOT NULL,
+    chunk_size INTEGER NOT NULL,
+    total_chunks INTEGER NOT NULL,
+    uploaded_chunks TEXT DEFAULT '[]',
+    status TEXT DEFAULT 'in_progress' CHECK(status IN ('in_progress','completed','failed','aborted')),
+    temp_path TEXT,
+    file_hash TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (device_id) REFERENCES devices(id)
+  );
+
+  CREATE TABLE IF NOT EXISTS conflicts (
+    id TEXT PRIMARY KEY,
+    clip_id_a TEXT NOT NULL,
+    clip_id_b TEXT NOT NULL,
+    device_id_a TEXT NOT NULL,
+    device_id_b TEXT NOT NULL,
+    resolved INTEGER DEFAULT 0,
+    chosen_clip_id TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY (clip_id_a) REFERENCES clips(id) ON DELETE CASCADE,
+    FOREIGN KEY (clip_id_b) REFERENCES clips(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS tags (
@@ -47,6 +80,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_clips_type ON clips(type);
   CREATE INDEX IF NOT EXISTS idx_clips_created ON clips(created_at DESC);
   CREATE INDEX IF NOT EXISTS idx_clips_content ON clips(content);
+  CREATE INDEX IF NOT EXISTS idx_clips_file_hash ON clips(file_hash);
+  CREATE INDEX IF NOT EXISTS idx_uploads_status ON uploads(status);
+  CREATE INDEX IF NOT EXISTS idx_conflicts_resolved ON conflicts(resolved);
 `);
 
 module.exports = db;

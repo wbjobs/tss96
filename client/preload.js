@@ -7,6 +7,8 @@ contextBridge.exposeInMainWorld("clipSync", {
   pushToDevice: (targetDeviceId, clip) => ipcRenderer.invoke("push-to-device", targetDeviceId, clip),
   copyToClipboard: (clip) => ipcRenderer.invoke("copy-to-clipboard", clip),
   apiRequest: (method, path, body, isFormData) => ipcRenderer.invoke("api-request", method, path, body, isFormData),
+  getUploadQueue: () => ipcRenderer.invoke("get-upload-queue"),
+  abortUpload: (taskId) => ipcRenderer.invoke("abort-upload", taskId),
 
   onClipboardChanged: (cb) => {
     ipcRenderer.on("clipboard-changed", (_e, clip) => cb(clip));
@@ -22,5 +24,17 @@ contextBridge.exposeInMainWorld("clipSync", {
   },
   onDownloadAndClipboardImage: (cb) => {
     ipcRenderer.on("download-and-clipboard-image", (_e, url) => cb(url));
+  },
+  onUploadProgress: (cb) => {
+    ipcRenderer.on("upload-progress", (_e, upload) => cb(upload));
+  },
+  onRemoteUploadProgress: (cb) => {
+    ipcRenderer.on("remote-upload-progress", (_e, data) => cb(data));
+  },
+  onConflictDetected: (cb) => {
+    ipcRenderer.on("conflict-detected", (_e, data) => cb(data));
+  },
+  onClipboardChangedConflict: (cb) => {
+    ipcRenderer.on("clipboard-changed-conflict", (_e, clip) => cb(clip));
   },
 });

@@ -5,6 +5,10 @@ let currentDevice = null;
 let allDevices = [];
 let selectedClip = null;
 let searchTimeout = null;
+const uploads = new Map();
+const pendingConflicts = [];
+let currentConflict = null;
+let selectedConflictClipId = null;
 
 async function init() {
   currentDevice = await api.getDeviceInfo();
@@ -18,10 +22,205 @@ async function init() {
   setupModals();
   setupSettings();
   setupRealtime();
+  setupUploadsPanel();
+  setupConflictUI();
 
   await loadClips();
   await loadDevices();
   await loadTags();
+  await loadPendingConflicts();
+  await refreshUploadQueue();
+}
+
+function setupUploadsPanel() {
+  const btnToggle = document.getElementById("btn-uploads-toggle");
+  const btnClose = document.getElementById("btn-close-uploads");
+  const panel = document.getElementById("uploads-panel");
+
+  btnToggle.addEventListener("click", () => {
+    const isHidden = panel.style.display === "none";
+    panel.style.display = isHidden ? "block" : "none";
+    if (isHidden) refreshUploadQueue();
+  });
+
+  btnClose.addEventListener("click", () => {
+    panel.style.display = "none";
+  });
+}
+
+function setupConflictUI() {
+  document.getElementById("btn-conflicts").addEventListener("click", async () => {
+    await loadPendingConflicts();
+    if (pendingConflicts.length) {
+      openConflictModal(pendingConflicts[0]);
+    }
+  });
+
+  document.getElementById("btn-keep-both").addEventListener("click", async () => {
+    if (!currentConflict) return;
+    await api.apiRequest("POST", `/api/conflicts/${currentConflict.id}/resolve`, { keepBoth: true });
+    closeConflictModal();
+    showNotification("Both clips kept");
+    await loadClips();
+    refreshConflictBadge();
+  });
+
+  document.getElementById("btn-resolve-latest").addEventListener("click", async () => {
+    if (!currentConflict) return;
+    const clips = currentConflict.clips || [];
+    if (!clips.length) return;
+    clips.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    const latest = clips[0];
+    await resolveConflictWithChoice(latest.id);
+  });
+}
+
+function openConflictModal(conflict) {
+  currentConflict = conflict;
+  selectedConflictClipId = null;
+  const container = document.getElementById("conflict-clips-container");
+
+  container.innerHTML = (conflict.clips || [])
+    .map((clip) => {
+      const icons = { text: "📝", image: "🖼", file: "📎" };
+      const icon = icons[clip.type] || "📋";
+      let preview = "";
+      if (clip.type === "text") {
+        preview = escapeHtml(clip.content || "");
+      } else if (clip.type === "image") {
+        const src = clip.file_path ? getConfig().httpUrl + clip.file_path : "";
+        preview = src ? `<img src="${src}" />` : "Image";
+      } else {
+        preview = escapeHtml(clip.content || clip.file_path || "File");
+      }
+      const isMine = clip.device_id === currentDevice.id;
+      return `<div class="conflict-clip-card" data-clip-id="${clip.id}">
+        <div class="conflict-clip-meta">
+          <span>${icon} ${clip.type.toUpperCase()}</span>
+          <span>·</span>
+          <span>${isMine ? "Your Device" : "Other Device"}</span>
+          <span>·</span>
+          <span>${formatTime(clip.created_at)}</span>
+        </div>
+        <div class="conflict-clip-preview">${preview}</div>
+      </div>`;
+    })
+    .join("");
+
+  container.querySelectorAll(".conflict-clip-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      container.querySelectorAll(".conflict-clip-card").forEach((c) => c.classList.remove("selected"));
+      card.classList.add("selected");
+      selectedConflictClipId = card.dataset.clipId;
+    });
+    card.addEventListener("dblclick", async () => {
+      selectedConflictClipId = card.dataset.clipId;
+      await resolveConflictWithChoice(selectedConflictClipId);
+    });
+  });
+
+  document.getElementById("conflict-modal").style.display = "flex";
+}
+
+function closeConflictModal() {
+  document.getElementById("conflict-modal").style.display = "none";
+  const idx = pendingConflicts.findIndex((c) => c.id === currentConflict.id);
+  if (idx >= 0) pendingConflicts.splice(idx, 1);
+  currentConflict = null;
+  refreshConflictBadge();
+}
+
+async function resolveConflictWithChoice(chosenClipId) {
+  if (!currentConflict) return;
+  await api.apiRequest("POST", `/api/conflicts/${currentConflict.id}/resolve`, {
+    chosenClipId,
+  });
+  closeConflictModal();
+  showNotification("Conflict resolved");
+  await loadClips();
+}
+
+async function loadPendingConflicts() {
+  try {
+    const conflicts = await api.apiRequest("GET", "/api/conflicts?resolved=false");
+    pendingConflicts.length = 0;
+    pendingConflicts.push(...conflicts);
+    refreshConflictBadge();
+  } catch {}
+}
+
+function refreshConflictBadge() {
+  const count = pendingConflicts.length;
+  const btn = document.getElementById("btn-conflicts");
+  const badge = document.getElementById("conflict-badge");
+  if (count > 0) {
+    btn.style.display = "inline-flex";
+    badge.style.display = "inline-block";
+    badge.textContent = count;
+  } else {
+    btn.style.display = "none";
+    badge.style.display = "none";
+  }
+}
+
+async function refreshUploadQueue() {
+  try {
+    const items = await api.getUploadQueue();
+    uploads.clear();
+    items.forEach((u) => uploads.set(u.taskId, u));
+    renderUploads();
+  } catch {}
+}
+
+function renderUploads() {
+  const list = document.getElementById("uploads-list");
+  const items = Array.from(uploads.values()).sort((a, b) => {
+    const order = { queued: 0, uploading: 1, completed: 2, failed: 3, aborted: 4 };
+    return (order[a.status] || 0) - (order[b.status] || 0);
+  });
+
+  const badge = document.getElementById("upload-badge");
+  const activeCount = items.filter((u) => u.status === "uploading" || u.status === "queued").length;
+  if (activeCount > 0) {
+    badge.style.display = "inline-block";
+    badge.textContent = activeCount;
+  } else {
+    badge.style.display = "none";
+  }
+
+  if (!items.length) {
+    list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);font-size:12px;">No uploads in queue</div>';
+    return;
+  }
+
+  list.innerHTML = items
+    .map((u) => {
+      const isDone = u.status === "completed" || u.status === "aborted" || u.status === "failed";
+      return `<div class="upload-item" data-task-id="${u.taskId}">
+        <div class="upload-item-header">
+          <span class="upload-filename">📎 ${escapeHtml(u.filename)}</span>
+          <span class="upload-status ${u.status}">${u.status}</span>
+        </div>
+        <div class="upload-progress-row">
+          <div class="progress-bar">
+            <div class="progress-bar-fill" style="width:${u.progress || 0}%"></div>
+          </div>
+          <span class="upload-progress-text">${u.progress || 0}%</span>
+        </div>
+        ${!isDone ? `<div class="upload-actions"><button class="btn btn-sm btn-danger btn-abort-upload" data-task-id="${u.taskId}">Cancel</button></div>` : ""}
+        ${u.error ? `<div style="color:var(--danger);font-size:11px;margin-top:4px;">${escapeHtml(u.error)}</div>` : ""}
+      </div>`;
+    })
+    .join("");
+
+  list.querySelectorAll(".btn-abort-upload").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      await api.abortUpload(btn.dataset.taskId);
+      uploads.delete(btn.dataset.taskId);
+      renderUploads();
+    });
+  });
 }
 
 function setupTabs() {
@@ -84,7 +283,7 @@ function setupModals() {
         const item = document.createElement("div");
         item.className = "push-device-item";
         const icon = d.platform === "darwin" ? "🍎" : d.platform === "linux" ? "🐧" : "🪟";
-        item.innerHTML = `<span style="font-size:20px;">${icon}</span><span>${d.name}</span>`;
+        item.innerHTML = `<span style="font-size:20px;">${icon}</span><span>${escapeHtml(d.name)}</span>`;
         item.addEventListener("click", async () => {
           await api.pushToDevice(d.id, selectedClip);
           showNotification(`Pushed to ${d.name}!`);
@@ -122,17 +321,21 @@ function setupSettings() {
 
 function setupRealtime() {
   api.onClipboardChanged((clip) => {
+    const idx = currentClips.findIndex((c) => c.id === clip.id);
+    if (idx >= 0) currentClips.splice(idx, 1);
     currentClips.unshift(clip);
     renderClips();
   });
 
   api.onClipCreatedRemote((clip) => {
+    const idx = currentClips.findIndex((c) => c.id === clip.id);
+    if (idx >= 0) currentClips.splice(idx, 1);
     currentClips.unshift(clip);
     renderClips();
   });
 
   api.onClipReceived((clip) => {
-    showNotification(`Received clip from another device!`);
+    showNotification("Received clip from another device!");
     loadClips();
   });
 
@@ -140,6 +343,39 @@ function setupRealtime() {
     const indicator = document.getElementById("ws-indicator");
     indicator.className = "status-dot " + status;
     indicator.title = status.charAt(0).toUpperCase() + status.slice(1);
+  });
+
+  api.onUploadProgress((upload) => {
+    uploads.set(upload.taskId, upload);
+    renderUploads();
+
+    if (upload.status === "completed") {
+      setTimeout(() => {
+        loadClips();
+      }, 300);
+    }
+  });
+
+  api.onRemoteUploadProgress((data) => {
+    renderClips();
+  });
+
+  api.onConflictDetected((data) => {
+    if (data.conflict && data.clips) {
+      pendingConflicts.push({
+        ...data.conflict,
+        clips: data.clips,
+      });
+      refreshConflictBadge();
+      if (!currentConflict) {
+        openConflictModal({ ...data.conflict, clips: data.clips });
+      }
+      showNotification("⚠ Clipboard conflict detected!");
+    }
+  });
+
+  api.onClipboardChangedConflict((clip) => {
+    showNotification("⚠ Conflict with another device");
   });
 }
 
@@ -208,12 +444,20 @@ function renderClips() {
 function renderClipItem(clip) {
   const icons = { text: "📝", image: "🖼", file: "📎" };
   const icon = icons[clip.type] || "📋";
-  const preview =
-    clip.type === "text"
-      ? escapeHtml(clip.content || "")
-      : clip.type === "image"
-      ? `<img src="${getConfig().httpUrl}${clip.file_path}" style="max-height:36px;border-radius:4px;" />`
-      : escapeHtml(clip.content || clip.file_path || "File");
+  const isUploading = clip.uploading;
+  let preview = "";
+
+  if (clip.type === "text") {
+    preview = escapeHtml(clip.content || "");
+  } else if (clip.type === "image") {
+    if (clip.file_path) {
+      preview = `<img src="${getConfig().httpUrl}${clip.file_path}" style="max-height:36px;border-radius:4px;" />`;
+    } else {
+      preview = `<span style="color:var(--text-muted);">Image ${isUploading ? "(uploading...)" : ""}</span>`;
+    }
+  } else {
+    preview = escapeHtml(clip.content || clip.file_path || "File");
+  }
 
   const time = formatTime(clip.created_at);
   const typeLabel = clip.type.charAt(0).toUpperCase() + clip.type.slice(1);
@@ -226,18 +470,20 @@ function renderClipItem(clip) {
   }
 
   return `
-    <div class="clip-item" data-clip-id="${clip.id}">
+    <div class="clip-item ${isUploading ? "uploading" : ""}" data-clip-id="${clip.id}">
       <div class="clip-icon">${icon}</div>
       <div class="clip-body">
         <div class="clip-preview">${preview}</div>
         <div class="clip-meta">
           <span>${typeLabel}</span>
           <span>${time}</span>
+          ${isUploading ? '<span style="color:var(--accent);">⏳ Uploading...</span>' : ""}
+          ${clip.hasConflict ? '<span style="color:var(--warning);">⚠ Conflict</span>' : ""}
         </div>
         ${tagsHtml}
       </div>
       <div class="clip-actions">
-        <button class="btn btn-sm btn-secondary btn-quick-copy" data-clip-id="${clip.id}" title="Copy">📋</button>
+        <button class="btn btn-sm btn-secondary btn-quick-copy" data-clip-id="${clip.id}" title="Copy" ${isUploading ? "disabled style=\"opacity:0.5;cursor:not-allowed;\"" : ""}>📋</button>
         <button class="btn btn-sm btn-secondary btn-tag-clip" data-clip-id="${clip.id}" title="Tag">🏷</button>
       </div>
     </div>
@@ -264,8 +510,8 @@ async function openClipDetail(clipId) {
   if (clip.type === "text") {
     body.innerHTML = `<div class="clip-detail-content">${escapeHtml(clip.content || "")}</div>${tagsHtml}`;
   } else if (clip.type === "image") {
-    const src = `${getConfig().httpUrl}${clip.file_path}`;
-    body.innerHTML = `<img class="clip-detail-image" src="${src}" />${tagsHtml}`;
+    const src = clip.file_path ? `${getConfig().httpUrl}${clip.file_path}` : clip.localPath || "";
+    body.innerHTML = src ? `<img class="clip-detail-image" src="${src}" />${tagsHtml}` : `<div style="color:var(--text-muted);text-align:center;padding:30px;">Image not yet available</div>${tagsHtml}`;
   } else {
     body.innerHTML = `<div class="clip-detail-content">${escapeHtml(clip.content || clip.file_path || "")}</div>${tagsHtml}`;
   }
@@ -335,13 +581,15 @@ function renderDevices() {
       const isCurrent = d.id === currentDevice.id;
       const icon = d.platform === "darwin" ? "🍎" : d.platform === "linux" ? "🐧" : "🪟";
       const lastSeen = formatTime(d.last_seen);
+      const statusClass = d.online || isCurrent ? "online" : "offline";
+      const statusLabel = d.online || isCurrent ? "Online" : "Offline";
       return `<div class="device-card">
         <span class="device-icon">${icon}</span>
         <div class="device-info">
           <div class="device-name">${escapeHtml(d.name)}${isCurrent ? " (This Device)" : ""}</div>
           <div class="device-meta">${d.platform} · Last seen: ${lastSeen}</div>
         </div>
-        <span class="device-status ${isCurrent ? "online" : "offline"}">${isCurrent ? "Online" : "Offline"}</span>
+        <span class="device-status ${statusClass}">${statusLabel}</span>
       </div>`;
     })
     .join("");

@@ -12,11 +12,21 @@
       <div class="header-left">
         <h1 class="logo">⌨ ClipSync</h1>
         <span id="ws-indicator" class="status-dot disconnected" title="Disconnected"></span>
+        <button class="btn btn-icon" id="btn-uploads-toggle" title="Uploads" style="margin-left:8px;">⬆<span id="upload-badge" class="upload-badge" style="display:none;">0</span></button>
       </div>
       <div class="header-right">
+        <button class="btn btn-icon" id="btn-conflicts" title="Conflicts" style="display:none;">⚠<span id="conflict-badge" class="upload-badge" style="display:none;">0</span></button>
         <button class="btn btn-icon" id="btn-settings" title="Settings">⚙</button>
       </div>
     </header>
+
+    <div id="uploads-panel" class="uploads-panel" style="display:none;">
+      <div class="uploads-panel-header">
+        <span>Upload Queue</span>
+        <button class="btn btn-icon" id="btn-close-uploads">&times;</button>
+      </div>
+      <div id="uploads-list" class="uploads-list"></div>
+    </div>
 
     <nav class="tabs">
       <button class="tab active" data-tab="history">History</button>
@@ -106,6 +116,23 @@
             <input type="text" id="setting-ws-url" />
           </div>
           <button class="btn btn-primary" id="btn-save-settings">Save & Reconnect</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="conflict-modal" class="modal" style="display:none;">
+      <div class="modal-content" style="max-width:700px;">
+        <div class="modal-header">
+          <h3>⚠ Clipboard Conflict Detected</h3>
+          <button class="btn btn-icon modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p style="color:var(--text-secondary);margin-bottom:14px;font-size:13px;">Two devices modified the clipboard within a short window. Choose how to resolve:</p>
+          <div id="conflict-clips-container" class="conflict-clips"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-secondary" id="btn-keep-both">Keep Both</button>
+          <button class="btn btn-primary" id="btn-resolve-latest" title="Keep the most recent clip">Keep Newest</button>
         </div>
       </div>
     </div>

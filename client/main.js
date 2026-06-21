@@ -10,11 +10,16 @@ const {
 } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
 const WebSocket = require("ws");
 
 const DEVICE_ID_FILE = path.join(app.getPath("userData"), "device.json");
 const CONFIG_FILE = path.join(app.getPath("userData"), "config.json");
+
+const CHUNK_SIZE = 5 * 1024 * 1024;
+const LARGE_FILE_THRESHOLD = 20 * 1024 * 1024;
+const CONCURRENT_CHUNKS = 3;
 
 let mainWindow = null;
 let tray = null;
@@ -26,6 +31,10 @@ let deviceName = null;
 let lastClipboardText = "";
 let lastClipboardImageHash = "";
 let clipboardWatchTimer = null;
+
+const uploadQueue = [];
+let uploadActive = false;
+const uploadsInProgress = new Map();
 
 function loadDeviceId() {
   if (fs.existsSync(DEVICE_ID_FILE)) {
@@ -49,6 +58,143 @@ function loadConfig() {
 
 function saveConfig() {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(currentConfig, null, 2));
+}
+
+function computeFileHash(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash("sha256");
+    const stream = fs.createReadStream(filePath);
+    stream.on("data", (d) => hash.update(d));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+  });
+}
+
+function sendUploadProgress(upload) {
+  if (mainWindow) {
+    mainWindow.webContents.send("upload-progress", upload);
+  }
+}
+
+function broadcastNewClip(clip) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "new_clip", clip }));
+  }
+}
+
+async function enqueueUpload(task) {
+  uploadQueue.push(task);
+  processUploadQueue();
+}
+
+async function processUploadQueue() {
+  if (uploadActive) return;
+  if (!uploadQueue.length) return;
+  uploadActive = true;
+
+  const task = uploadQueue.shift();
+  try {
+    await performChunkedUpload(task);
+  } catch (err) {
+    task.status = "failed";
+    task.error = err.message;
+    sendUploadProgress(task);
+  } finally {
+    uploadActive = false;
+    processUploadQueue();
+  }
+}
+
+async function performChunkedUpload(task) {
+  const httpUrl = currentConfig.httpUrl;
+  const fileSize = fs.statSync(task.filePath).size;
+
+  let fileHash = task.fileHash;
+  if (!fileHash) {
+    fileHash = await computeFileHash(task.filePath);
+  }
+
+  const initRes = await fetch(httpUrl + "/api/uploads/init", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      deviceId,
+      clipType: task.type,
+      filename: task.filename,
+      totalSize: fileSize,
+      chunkSize: CHUNK_SIZE,
+      fileHash,
+    }),
+  }).then((r) => r.json());
+
+  if (initRes.alreadyExists) {
+    task.status = "completed";
+    task.progress = 100;
+    task.result = { clip: initRes.clip };
+    sendUploadProgress(task);
+    broadcastNewClip(initRes.clip);
+    if (mainWindow) mainWindow.webContents.send("clipboard-changed", initRes.clip);
+    return;
+  }
+
+  const uploadId = initRes.uploadId;
+  task.uploadId = uploadId;
+  task.totalChunks = initRes.totalChunks;
+  task.status = "uploading";
+  task.progress = 0;
+  uploadsInProgress.set(uploadId, task);
+  sendUploadProgress(task);
+
+  const totalChunks = initRes.totalChunks;
+  let uploadedCount = 0;
+  let chunkIndex = 0;
+
+  const uploadChunk = async (idx) => {
+    const form = new (require("form-data"))();
+    const start = idx * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, fileSize);
+    const chunkBuf = fs.readFileSync(task.filePath, { start, end: end - 1 });
+    form.append("index", String(idx));
+    form.append("chunk", chunkBuf, {
+      filename: `chunk-${idx}`,
+      contentType: "application/octet-stream",
+    });
+
+    const r = await fetch(`${httpUrl}/api/uploads/${uploadId}/chunk`, {
+      method: "POST",
+      body: form,
+      headers: form.getHeaders(),
+    });
+    const data = await r.json();
+    uploadedCount++;
+    task.progress = Math.round((uploadedCount / totalChunks) * 100);
+    sendUploadProgress(task);
+    return data;
+  };
+
+  while (chunkIndex < totalChunks) {
+    const batch = [];
+    while (chunkIndex < totalChunks && batch.length < CONCURRENT_CHUNKS) {
+      batch.push(uploadChunk(chunkIndex));
+      chunkIndex++;
+    }
+    await Promise.all(batch);
+  }
+
+  const completeRes = await fetch(`${httpUrl}/api/uploads/${uploadId}/complete`, {
+    method: "POST",
+  }).then((r) => r.json());
+
+  task.status = "completed";
+  task.progress = 100;
+  task.result = completeRes;
+  uploadsInProgress.delete(uploadId);
+  sendUploadProgress(task);
+
+  if (completeRes.clip) {
+    broadcastNewClip(completeRes.clip);
+    if (mainWindow) mainWindow.webContents.send("clipboard-changed", completeRes.clip);
+  }
 }
 
 function connectWebSocket() {
@@ -91,6 +237,22 @@ function connectWebSocket() {
 
     if (msg.type === "clip_created") {
       if (mainWindow) mainWindow.webContents.send("clip-created-remote", msg.clip);
+    }
+
+    if (msg.type === "upload_progress") {
+      if (mainWindow) {
+        mainWindow.webContents.send("remote-upload-progress", {
+          uploadId: msg.uploadId,
+          filename: msg.filename,
+          progress: msg.progress,
+        });
+      }
+    }
+
+    if (msg.type === "conflict_detected") {
+      if (mainWindow) {
+        mainWindow.webContents.send("conflict-detected", msg);
+      }
     }
   });
 
@@ -141,7 +303,58 @@ function uploadClipToServer(clip) {
         type: "text",
         content: clip.content,
       }),
-    }).then((r) => r.json());
+    })
+      .then((r) => r.json())
+      .then((saved) => {
+        if (saved.hasConflict) {
+          if (mainWindow) mainWindow.webContents.send("clipboard-changed-conflict", saved);
+        }
+        return saved;
+      });
+  }
+
+  if (clip.type === "image" || clip.type === "file") {
+    if (clip.fileSize && clip.fileSize >= LARGE_FILE_THRESHOLD) {
+      const task = {
+        taskId: uuidv4(),
+        type: clip.type,
+        filePath: clip.localPath,
+        filename: clip.filename || clip.content || "file",
+        fileSize: clip.fileSize,
+        fileHash: clip.fileHash,
+        status: "queued",
+        progress: 0,
+      };
+      enqueueUpload(task);
+      if (mainWindow) mainWindow.webContents.send("clipboard-changed", { ...clip, uploading: true, taskId: task.taskId });
+      return Promise.resolve({ ok: true, id: clip.id, uploading: true, taskId: task.taskId });
+    }
+
+    return new Promise((resolve, reject) => {
+      const FormData = require("form-data");
+      const form = new FormData();
+      const buffer = fs.readFileSync(clip.localPath);
+      form.append("file", buffer, {
+        filename: clip.filename || clip.content || "file",
+        contentType: clip.type === "image" ? "image/png" : "application/octet-stream",
+      });
+      form.append("deviceId", deviceId);
+      if (clip.fileHash) form.append("fileHash", clip.fileHash);
+
+      fetch(httpUrl + "/api/clips/" + clip.type, {
+        method: "POST",
+        body: form,
+        headers: form.getHeaders(),
+      })
+        .then((r) => r.json())
+        .then((saved) => {
+          if (saved.hasConflict) {
+            if (mainWindow) mainWindow.webContents.send("clipboard-changed-conflict", saved);
+          }
+          resolve(saved);
+        })
+        .catch(reject);
+    });
   }
 
   return Promise.resolve({ ok: true, id: clip.id });
@@ -162,8 +375,17 @@ function startClipboardWatcher() {
           created_at: new Date().toISOString(),
           device_id: deviceId,
         };
-        uploadClipToServer(clip).then(() => notifyNewClip(clip));
-        if (mainWindow) mainWindow.webContents.send("clipboard-changed", clip);
+        uploadClipToServer(clip).then((saved) => {
+          if (saved && saved.id && !saved.uploading) {
+            notifyNewClip(saved);
+            if (mainWindow && !saved.hasConflict) {
+              mainWindow.webContents.send("clipboard-changed", saved);
+            }
+          }
+        });
+        if (mainWindow && !clip._skipNotify) {
+          mainWindow.webContents.send("clipboard-changed", clip);
+        }
         return;
       }
 
@@ -181,33 +403,29 @@ function startClipboardWatcher() {
 
           const filePath = path.join(uploadsDir, fileName);
           fs.writeFileSync(filePath, buffer);
+          const fileSize = buffer.length;
 
-          const httpUrl = currentConfig.httpUrl;
-          const FormData = require("form-data");
-          const form = new FormData();
-          form.append("file", buffer, { filename: fileName, contentType: "image/png" });
-          form.append("deviceId", deviceId);
+          const clip = {
+            id: clipId,
+            type: "image",
+            filename: fileName,
+            localPath: filePath,
+            fileSize,
+            device_id: deviceId,
+            created_at: new Date().toISOString(),
+          };
 
-          fetch(httpUrl + "/api/clips/image", {
-            method: "POST",
-            body: form,
-            headers: form.getHeaders(),
-          })
-            .then((r) => r.json())
-            .then((savedClip) => {
-              const clip = {
-                ...savedClip,
-                type: "image",
-                localPath: filePath,
-                device_id: deviceId,
-              };
-              notifyNewClip(clip);
-              if (mainWindow) mainWindow.webContents.send("clipboard-changed", clip);
-            })
-            .catch(() => {});
+          uploadClipToServer(clip).then((saved) => {
+            if (saved && saved.id && !saved.uploading) {
+              notifyNewClip(saved);
+            }
+          });
+          if (mainWindow) mainWindow.webContents.send("clipboard-changed", clip);
         }
       }
-    } catch {}
+    } catch (e) {
+      console.error("Clipboard watcher error:", e);
+    }
   }, 500);
 }
 
@@ -319,6 +537,28 @@ app.whenReady().then(() => {
     }
     const r = await fetch(url, opts);
     return r.json();
+  });
+
+  ipcMain.handle("get-upload-queue", () => {
+    return [...uploadQueue, ...Array.from(uploadsInProgress.values())];
+  });
+
+  ipcMain.handle("abort-upload", (_e, taskId) => {
+    const idx = uploadQueue.findIndex((t) => t.taskId === taskId);
+    if (idx >= 0) {
+      uploadQueue.splice(idx, 1);
+      return true;
+    }
+    const task = Array.from(uploadsInProgress.values()).find((t) => t.taskId === taskId);
+    if (task && task.uploadId) {
+      fetch(currentConfig.httpUrl + "/api/uploads/" + task.uploadId + "/abort", { method: "POST" })
+        .then(() => {
+          task.status = "aborted";
+          sendUploadProgress(task);
+        })
+        .catch(() => {});
+    }
+    return true;
   });
 
   ipcMain.on("ws-status", (e) => e);

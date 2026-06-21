@@ -3,11 +3,12 @@ const cors = require("cors");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { v4: uuidv4 } = require("uuid");
 const http = require("http");
 
 const db = require("./db");
-const { setupWebSocket } = require("./ws");
+const { setupWebSocket, clients } = require("./ws");
 
 const app = express();
 const server = http.createServer(app);
@@ -16,8 +17,12 @@ const PORT = process.env.PORT || 3200;
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
 
-const UPLOAD_DIR = path.join(__dirname, "..", "data", "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const DATA_DIR = path.join(__dirname, "..", "data");
+const UPLOAD_DIR = path.join(DATA_DIR, "uploads");
+const CHUNK_DIR = path.join(DATA_DIR, "chunks");
+for (const d of [UPLOAD_DIR, CHUNK_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+}
 
 const storage = multer.diskStorage({
   destination: UPLOAD_DIR,
@@ -28,9 +33,86 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
 
+const chunkStorage = multer.diskStorage({
+  destination: CHUNK_DIR,
+  filename: (_req, file, cb) => {
+    cb(null, uuidv4() + ".chunk");
+  },
+});
+const chunkUpload = multer({
+  storage: chunkStorage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
+
 app.use("/uploads", express.static(UPLOAD_DIR));
 
-setupWebSocket(server);
+const wss = setupWebSocket(server);
+
+const CONFLICT_WINDOW_MS = 5000;
+
+function broadcastToAllExcept(senderId, msg) {
+  for (const [cid, client] of clients) {
+    if (cid !== senderId && client.readyState === 1) {
+      client.send(JSON.stringify(msg));
+    }
+  }
+}
+
+function sendToDevice(deviceId, msg) {
+  const client = clients.get(deviceId);
+  if (client && client.readyState === 1) {
+    client.send(JSON.stringify(msg));
+  }
+}
+
+function detectPotentialConflict(newClip) {
+  const recent = db
+    .prepare(
+      `SELECT * FROM clips WHERE device_id != ? AND created_at > datetime('now', ?) ORDER BY created_at DESC LIMIT 1`
+    )
+    .get(newClip.device_id, "-" + CONFLICT_WINDOW_MS / 1000 + " seconds");
+
+  if (!recent) return null;
+
+  const sameType = recent.type === newClip.type;
+  if (!sameType) return null;
+
+  if (newClip.type === "text" && newClip.content && recent.content) {
+    if (newClip.content.length > 20 && recent.content.length > 20) {
+      return recent;
+    }
+  }
+  if (newClip.type === "image" || newClip.type === "file") {
+    if (newClip.file_hash && recent.file_hash && newClip.file_hash !== recent.file_hash) {
+      return recent;
+    }
+  }
+  return null;
+}
+
+function createConflictRecord(clipA, clipB) {
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO conflicts (id, clip_id_a, clip_id_b, device_id_a, device_id_b) VALUES (?, ?, ?, ?, ?)`
+  ).run(id, clipA.id, clipB.id, clipA.device_id, clipB.device_id);
+
+  db.prepare("UPDATE clips SET resolved = 2, conflict_of = ? WHERE id = ?").run(
+    id,
+    clipB.id
+  );
+
+  const conflict = db.prepare("SELECT * FROM conflicts WHERE id = ?").get(id);
+
+  for (const deviceId of [clipA.device_id, clipB.device_id]) {
+    sendToDevice(deviceId, {
+      type: "conflict_detected",
+      conflict,
+      clips: [clipA, clipB],
+    });
+  }
+
+  return conflict;
+}
 
 app.post("/api/devices", (req, res) => {
   const { id, name, platform } = req.body;
@@ -48,56 +130,293 @@ app.post("/api/devices", (req, res) => {
 
 app.get("/api/devices", (_req, res) => {
   const devices = db.prepare("SELECT * FROM devices ORDER BY last_seen DESC").all();
-  res.json(devices);
+  const onlineIds = new Set(clients.keys());
+  res.json(
+    devices.map((d) => ({
+      ...d,
+      online: onlineIds.has(d.id),
+    }))
+  );
 });
 
 app.post("/api/clips", (req, res) => {
-  const { id, deviceId, type, content, filePath, thumbnail } = req.body;
+  const { id, deviceId, type, content, filePath, thumbnail, fileHash, fileSize } = req.body;
   if (!deviceId || !type) return res.status(400).json({ error: "Missing fields" });
 
   const clipId = id || uuidv4();
   db.prepare(
-    "INSERT INTO clips (id, device_id, type, content, file_path, thumbnail) VALUES (?, ?, ?, ?, ?, ?)"
-  ).run(clipId, deviceId, type, content || null, filePath || null, thumbnail || null);
+    "INSERT INTO clips (id, device_id, type, content, file_path, thumbnail, file_hash, file_size) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(
+    clipId,
+    deviceId,
+    type,
+    content || null,
+    filePath || null,
+    thumbnail || null,
+    fileHash || null,
+    fileSize || null
+  );
 
   const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(clipId);
+
+  const conflicting = detectPotentialConflict(clip);
+  if (conflicting) {
+    createConflictRecord(conflicting, clip);
+    clip.hasConflict = true;
+    clip.conflictWith = conflicting.id;
+  } else {
+    broadcastToAllExcept(deviceId, {
+      type: "clip_created",
+      clip,
+      fromDeviceId: deviceId,
+    });
+  }
+
   res.json(clip);
 });
 
 app.post("/api/clips/image", upload.single("file"), (req, res) => {
-  const { deviceId } = req.body;
+  const { deviceId, fileHash } = req.body;
   if (!deviceId || !req.file) return res.status(400).json({ error: "Missing fields" });
 
   const clipId = uuidv4();
   const filePath = `/uploads/${req.file.filename}`;
+  const fileSize = req.file.size;
   db.prepare(
-    "INSERT INTO clips (id, device_id, type, content, file_path) VALUES (?, ?, 'image', ?, ?)"
-  ).run(clipId, deviceId, req.file.originalname, filePath);
+    "INSERT INTO clips (id, device_id, type, content, file_path, file_hash, file_size) VALUES (?, ?, 'image', ?, ?, ?, ?)"
+  ).run(clipId, deviceId, req.file.originalname, filePath, fileHash || null, fileSize);
 
   const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(clipId);
+
+  const conflicting = detectPotentialConflict(clip);
+  if (conflicting) {
+    createConflictRecord(conflicting, clip);
+    clip.hasConflict = true;
+    clip.conflictWith = conflicting.id;
+  } else {
+    broadcastToAllExcept(deviceId, {
+      type: "clip_created",
+      clip,
+      fromDeviceId: deviceId,
+    });
+  }
+
   res.json(clip);
 });
 
 app.post("/api/clips/file", upload.single("file"), (req, res) => {
-  const { deviceId } = req.body;
+  const { deviceId, fileHash } = req.body;
   if (!deviceId || !req.file) return res.status(400).json({ error: "Missing fields" });
 
   const clipId = uuidv4();
   const filePath = `/uploads/${req.file.filename}`;
+  const fileSize = req.file.size;
   db.prepare(
-    "INSERT INTO clips (id, device_id, type, content, file_path) VALUES (?, ?, 'file', ?, ?)"
-  ).run(clipId, deviceId, req.file.originalname, filePath);
+    "INSERT INTO clips (id, device_id, type, content, file_path, file_hash, file_size) VALUES (?, ?, 'file', ?, ?, ?, ?)"
+  ).run(clipId, deviceId, req.file.originalname, filePath, fileHash || null, fileSize);
 
   const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(clipId);
+
+  const conflicting = detectPotentialConflict(clip);
+  if (conflicting) {
+    createConflictRecord(conflicting, clip);
+    clip.hasConflict = true;
+    clip.conflictWith = conflicting.id;
+  } else {
+    broadcastToAllExcept(deviceId, {
+      type: "clip_created",
+      clip,
+      fromDeviceId: deviceId,
+    });
+  }
+
   res.json(clip);
 });
 
+app.post("/api/uploads/init", (req, res) => {
+  const { deviceId, clipType, filename, totalSize, chunkSize, fileHash } = req.body;
+  if (!deviceId || !clipType || !filename || !totalSize || !chunkSize) {
+    return res.status(400).json({ error: "Missing fields" });
+  }
+
+  const existing = db
+    .prepare("SELECT * FROM clips WHERE file_hash = ? AND file_size = ? LIMIT 1")
+    .get(fileHash, totalSize);
+  if (existing) {
+    return res.json({ alreadyExists: true, clip: existing });
+  }
+
+  const uploadId = uuidv4();
+  const totalChunks = Math.ceil(totalSize / chunkSize);
+  const tempPath = path.join(CHUNK_DIR, uploadId + ".tmp");
+
+  db.prepare(
+    `INSERT INTO uploads (id, device_id, clip_type, filename, total_size, chunk_size, total_chunks, uploaded_chunks, temp_path, file_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, '[]', ?, ?)`
+  ).run(
+    uploadId,
+    deviceId,
+    clipType,
+    filename,
+    totalSize,
+    chunkSize,
+    totalChunks,
+    tempPath,
+    fileHash || null
+  );
+
+  if (!fs.existsSync(tempPath)) fs.writeFileSync(tempPath, Buffer.alloc(0));
+
+  res.json({
+    uploadId,
+    totalChunks,
+    chunkSize,
+    uploadedChunks: [],
+    status: "in_progress",
+  });
+});
+
+app.get("/api/uploads/:id", (req, res) => {
+  const upload = db.prepare("SELECT * FROM uploads WHERE id = ?").get(req.params.id);
+  if (!upload) return res.status(404).json({ error: "Not found" });
+  try {
+    upload.uploaded_chunks = JSON.parse(upload.uploaded_chunks || "[]");
+  } catch {
+    upload.uploaded_chunks = [];
+  }
+  res.json(upload);
+});
+
+app.post("/api/uploads/:id/chunk", chunkUpload.single("chunk"), (req, res) => {
+  const uploadId = req.params.id;
+  const { index } = req.body;
+  if (!req.file || index === undefined) {
+    return res.status(400).json({ error: "Missing chunk or index" });
+  }
+
+  const upload = db.prepare("SELECT * FROM uploads WHERE id = ?").get(uploadId);
+  if (!upload) return res.status(404).json({ error: "Upload not found" });
+  if (upload.status === "completed") return res.json({ ok: true, alreadyDone: true });
+
+  let uploaded;
+  try {
+    uploaded = JSON.parse(upload.uploaded_chunks || "[]");
+  } catch {
+    uploaded = [];
+  }
+  const chunkIdx = parseInt(index);
+
+  if (!uploaded.includes(chunkIdx)) {
+    const chunkData = fs.readFileSync(req.file.path);
+    const fd = fs.openSync(upload.temp_path, "r+");
+    try {
+      fs.writeSync(fd, chunkData, 0, chunkData.length, chunkIdx * upload.chunk_size);
+    } finally {
+      fs.closeSync(fd);
+    }
+    uploaded.push(chunkIdx);
+    uploaded.sort((a, b) => a - b);
+    db.prepare("UPDATE uploads SET uploaded_chunks = ? WHERE id = ?").run(
+      JSON.stringify(uploaded),
+      uploadId
+    );
+  }
+
+  fs.unlink(req.file.path, () => {});
+
+  const progress = uploaded.length / upload.total_chunks;
+  broadcastToAllExcept(upload.device_id, {
+    type: "upload_progress",
+    uploadId,
+    progress,
+    filename: upload.filename,
+  });
+
+  res.json({
+    ok: true,
+    progress,
+    uploadedChunks: uploaded.length,
+    totalChunks: upload.total_chunks,
+  });
+});
+
+app.post("/api/uploads/:id/complete", (req, res) => {
+  const uploadId = req.params.id;
+  const upload = db.prepare("SELECT * FROM uploads WHERE id = ?").get(uploadId);
+  if (!upload) return res.status(404).json({ error: "Upload not found" });
+
+  let uploaded;
+  try {
+    uploaded = JSON.parse(upload.uploaded_chunks || "[]");
+  } catch {
+    uploaded = [];
+  }
+
+  if (uploaded.length < upload.total_chunks) {
+    return res
+      .status(400)
+      .json({ error: `Missing chunks: ${uploaded.length}/${upload.total_chunks}` });
+  }
+
+  const stats = fs.statSync(upload.temp_path);
+  if (stats.size !== upload.total_size) {
+    return res.status(400).json({
+      error: `Size mismatch: expected ${upload.total_size}, got ${stats.size}`,
+    });
+  }
+
+  const ext = path.extname(upload.filename);
+  const destFilename = uuidv4() + (ext || "");
+  const destPath = path.join(UPLOAD_DIR, destFilename);
+  fs.renameSync(upload.temp_path, destPath);
+
+  const clipId = uuidv4();
+  const filePath = `/uploads/${destFilename}`;
+  db.prepare(
+    "INSERT INTO clips (id, device_id, type, content, file_path, file_hash, file_size) VALUES (?, ?, ?, ?, ?, ?, ?)"
+  ).run(clipId, upload.device_id, upload.clip_type, upload.filename, filePath, upload.file_hash, upload.total_size);
+
+  db.prepare("UPDATE uploads SET status = 'completed' WHERE id = ?").run(uploadId);
+
+  const clip = db.prepare("SELECT * FROM clips WHERE id = ?").get(clipId);
+
+  const conflicting = detectPotentialConflict(clip);
+  if (conflicting) {
+    createConflictRecord(conflicting, clip);
+    clip.hasConflict = true;
+    clip.conflictWith = conflicting.id;
+  } else {
+    broadcastToAllExcept(upload.device_id, {
+      type: "clip_created",
+      clip,
+      fromDeviceId: upload.device_id,
+    });
+  }
+
+  res.json({ clip, status: "completed" });
+});
+
+app.post("/api/uploads/:id/abort", (req, res) => {
+  const uploadId = req.params.id;
+  const upload = db.prepare("SELECT * FROM uploads WHERE id = ?").get(uploadId);
+  if (!upload) return res.status(404).json({ error: "Upload not found" });
+
+  db.prepare("UPDATE uploads SET status = 'aborted' WHERE id = ?").run(uploadId);
+  if (upload.temp_path && fs.existsSync(upload.temp_path)) {
+    fs.unlink(upload.temp_path, () => {});
+  }
+  res.json({ ok: true });
+});
+
 app.get("/api/clips", (req, res) => {
-  const { type, deviceId, limit, offset } = req.query;
+  const { type, deviceId, limit, offset, includeResolved } = req.query;
   let sql = "SELECT c.* FROM clips c";
   const params = [];
   const conditions = [];
 
+  if (includeResolved !== "true") {
+    conditions.push("c.resolved != 2");
+  }
   if (type) {
     conditions.push("c.type = ?");
     params.push(type);
@@ -126,7 +445,7 @@ app.get("/api/clips/search", (req, res) => {
   const { q, type } = req.query;
   if (!q) return res.status(400).json({ error: "Missing query" });
 
-  let sql = `SELECT c.* FROM clips c WHERE c.content LIKE ?`;
+  let sql = `SELECT c.* FROM clips c WHERE c.content LIKE ? AND c.resolved != 2`;
   const params = [`%${q}%`];
 
   if (type) {
@@ -148,6 +467,67 @@ app.get("/api/clips/:id", (req, res) => {
 app.delete("/api/clips/:id", (req, res) => {
   db.prepare("DELETE FROM clips WHERE id = ?").run(req.params.id);
   res.json({ ok: true });
+});
+
+app.get("/api/conflicts", (req, res) => {
+  const { resolved } = req.query;
+  let sql = "SELECT c.* FROM conflicts c";
+  const params = [];
+  if (resolved !== undefined) {
+    sql += " WHERE c.resolved = ?";
+    params.push(resolved === "true" ? 1 : 0);
+  }
+  sql += " ORDER BY c.created_at DESC LIMIT 100";
+  const conflicts = db.prepare(sql).all(...params);
+
+  const withClips = conflicts.map((conflict) => {
+    const clipA = db.prepare("SELECT * FROM clips WHERE id = ?").get(conflict.clip_id_a);
+    const clipB = db.prepare("SELECT * FROM clips WHERE id = ?").get(conflict.clip_id_b);
+    return { ...conflict, clips: [clipA, clipB] };
+  });
+
+  res.json(withClips);
+});
+
+app.post("/api/conflicts/:id/resolve", (req, res) => {
+  const { chosenClipId, keepBoth } = req.body;
+  const conflictId = req.params.id;
+
+  const conflict = db.prepare("SELECT * FROM conflicts WHERE id = ?").get(conflictId);
+  if (!conflict) return res.status(404).json({ error: "Conflict not found" });
+
+  if (keepBoth) {
+    db.prepare("UPDATE conflicts SET resolved = 1 WHERE id = ?").run(conflictId);
+    db.prepare("UPDATE clips SET resolved = 1, conflict_of = NULL WHERE id IN (?, ?)").run(
+      conflict.clip_id_a,
+      conflict.clip_id_b
+    );
+  } else if (chosenClipId) {
+    const toKeep = db.prepare("SELECT * FROM clips WHERE id = ?").get(chosenClipId);
+    const losingId =
+      chosenClipId === conflict.clip_id_a ? conflict.clip_id_b : conflict.clip_id_a;
+    if (!toKeep) return res.status(400).json({ error: "Invalid chosenClipId" });
+
+    db.prepare("UPDATE conflicts SET resolved = 1, chosen_clip_id = ? WHERE id = ?").run(
+      chosenClipId,
+      conflictId
+    );
+    db.prepare("UPDATE clips SET resolved = 1, conflict_of = NULL WHERE id = ?").run(
+      chosenClipId
+    );
+    db.prepare("DELETE FROM clips WHERE id = ?").run(losingId);
+
+    broadcastToAllExcept(toKeep.device_id, {
+      type: "clip_created",
+      clip: toKeep,
+      fromDeviceId: toKeep.device_id,
+    });
+  } else {
+    return res.status(400).json({ error: "Missing chosenClipId or keepBoth" });
+  }
+
+  const updated = db.prepare("SELECT * FROM conflicts WHERE id = ?").get(conflictId);
+  res.json({ ok: true, conflict: updated });
 });
 
 app.post("/api/clips/:id/tags", (req, res) => {
@@ -172,10 +552,7 @@ app.delete("/api/clips/:id/tags/:tagName", (req, res) => {
   const tag = db.prepare("SELECT id FROM tags WHERE name = ?").get(req.params.tagName);
   if (!tag) return res.status(404).json({ error: "Tag not found" });
 
-  db.prepare("DELETE FROM clip_tags WHERE clip_id = ? AND tag_id = ?").run(
-    req.params.id,
-    tag.id
-  );
+  db.prepare("DELETE FROM clip_tags WHERE clip_id = ? AND tag_id = ?").run(req.params.id, tag.id);
   res.json({ ok: true });
 });
 
@@ -217,10 +594,12 @@ app.get("/api/stats", (_req, res) => {
   const totalClips = db.prepare("SELECT COUNT(*) as count FROM clips").get().count;
   const totalDevices = db.prepare("SELECT COUNT(*) as count FROM devices").get().count;
   const totalTags = db.prepare("SELECT COUNT(*) as count FROM tags").get().count;
-  const byType = db
-    .prepare("SELECT type, COUNT(*) as count FROM clips GROUP BY type")
-    .all();
-  res.json({ totalClips, totalDevices, totalTags, byType });
+  const totalConflicts = db.prepare("SELECT COUNT(*) as count FROM conflicts").get().count;
+  const pendingConflicts = db
+    .prepare("SELECT COUNT(*) as count FROM conflicts WHERE resolved = 0")
+    .get().count;
+  const byType = db.prepare("SELECT type, COUNT(*) as count FROM clips GROUP BY type").all();
+  res.json({ totalClips, totalDevices, totalTags, totalConflicts, pendingConflicts, byType });
 });
 
 server.listen(PORT, "0.0.0.0", () => {
